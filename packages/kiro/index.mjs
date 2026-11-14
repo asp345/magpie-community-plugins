@@ -861,8 +861,11 @@ function account(client, magpie) {
 
 const windows = new Map() // a model's context, as Kiro last listed it
 const natives = new Map() // a model's effort levels sent as fields, as Kiro last listed them (nativeOf)
+const catalogLookups = new Map()
+const CATALOG_TTL = 10 * 60 * 1000
 
-// nativeOf reads the model's effort levels and whether it requires adaptive thinking.
+// Effort must match ListAvailableModels' schema (#538): adaptive models
+// require thinking.type, while GPT and Grok advertise reasoning.effort alone.
 function nativeOf(s) {
   if (!s || typeof s !== "object" || Array.isArray(s)) return undefined
   const types = s.properties?.thinking?.properties?.type?.enum
@@ -980,6 +983,17 @@ async function listModels(a) {
   for (const m of list) windows.set(m.id, m.context)
   for (const m of out?.models ?? []) if (m?.modelId) natives.set(m.modelId, nativeOf(m.additionalModelRequestFieldsSchema))
   return list
+}
+
+// Request-time catalog reads are optional metadata.
+async function loadModelCatalog(a, auth) {
+  const key = JSON.stringify([regionKey(auth), auth?.key, a.profile, a.region])
+  let lookup = catalogLookups.get(key)
+  if (!lookup || lookup.until <= Date.now()) {
+    lookup = { until: Date.now() + CATALOG_TTL, pending: listModels(a).catch(() => {}) }
+    catalogLookups.set(key, lookup)
+  }
+  await lookup.pending
 }
 
 // ---- the request: Messages → a Kiro conversation ---------------------------------------
@@ -1165,7 +1179,8 @@ function thinking(req, model) {
   return 20000
 }
 
-// nativeFields sends effort on the field advertised by the model's schema.
+// Adaptive models accept effort only with thinking enabled (#538).
+// Native reasoning-only models use reasoning.effort without thinking.type.
 function nativeFields(req, model) {
   const n = natives.get(model)
   if (!n) return undefined
@@ -1224,6 +1239,8 @@ function reasoningScope(auth, a, model) {
   return createHash("sha256").update(JSON.stringify([identity, auth?.uid ?? uidOf(auth?.loginProvider), a.profile, a.region, model])).digest("hex").slice(0, 32)
 }
 
+// GenerateAssistantResponse is also the intermediate shape for CreateResponse.
+// Images are fitted by kiroBody.
 function buildKiro(req, model, profile, budget, conversation, scope) {
   return JSON.stringify(kiroRequest(req, model, profile, budget, conversation, scope))
 }
@@ -2696,7 +2713,7 @@ async function ask(creds, auth, req, model, budget, signal, conversation) {
   }
   if (a.pinned) return { status: 429, message: pinnedUnavailable(a) }
   const send = async () => {
-    if (!thinks(model) && !windows.has(model)) await listModels(a)
+    if (!thinks(model) && !windows.has(model)) await loadModelCatalog(a, auth)
     a.scope = reasoningScope(auth, a, model)
     return paced(a, await kiroBody(req, model, a.profile, budget, conversation, a.scope), signal)
   }
@@ -3244,6 +3261,7 @@ export async function KiroAuthPlugin({ client, magpie } = {}) {
             } catch {
               return errorResponse(400, "a request that isn't JSON")
             }
+            // magpie's header carries the user's selected effort and takes precedence over the body.
             const effort = new Headers(init.headers ?? (input instanceof Request ? input.headers : undefined)).get("x-magpie-effort")
             if (effort) req.output_config = { ...req.output_config, effort }
             return generate(creds, (await getAuth()) ?? auth, req, init.signal, sessionOf(input, init))

@@ -143,7 +143,7 @@ request:
   events (streamed) or one message. The reply includes text, thinking,
   tool calls and usage. When Kiro reports only how full the context is,
   input tokens are estimated from that.
-- Claude models and Auto use prompt thinking budgets of low 10k, medium 20k, high 30k, and xhigh/max 50k when their catalog has no native adaptive settings. Models whose catalog advertises adaptive thinking receive `additionalModelRequestFields.thinking.type: "adaptive"` and the selected effort under `output_config.effort` or `reasoning.effort`. Claude thinking requires `thinking.type` to be `enabled` or `adaptive`. GPT and Grok models that advertise `reasoning.effort` receive that field directly, with the levels from their catalog. GPT thinking disabled maps to `none` when the model offers it.
+- Claude models and Auto use prompt thinking budgets of low 10k, medium 20k, high 30k, and xhigh/max 50k when their catalog has no native adaptive settings. Models whose catalog advertises adaptive thinking receive `additionalModelRequestFields.thinking.type: "adaptive"` and the selected effort under `output_config.effort` or `reasoning.effort`. Claude thinking requires `thinking.type` to be `enabled` or `adaptive`. GPT and Grok models that advertise `reasoning.effort` receive that field directly, with the levels from their catalog. GPT thinking disabled maps to `none` when the model offers it. Cold request-time catalog lookups are optional and shared by account and region for ten minutes, including failures and missing models. A failed lookup does not block chat.
 - Anthropic's hosted web search is answered with Kiro's own web search
   (see [Web search](#web-search)).
 - Kiro's failures keep their meaning:

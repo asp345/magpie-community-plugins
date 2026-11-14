@@ -165,7 +165,7 @@ test("the first native-model request loads its schema and applies magpie's effor
   try {
     const plugin = await KiroAuthPlugin()
     const loader = await plugin.auth.loader(async () => ({ type: "oauth", access: "t", expires: Date.now() + 3600000, accountId: "account", uid: "google", loginProvider: "Google", profileArn: "arn:aws:codewhisperer:us-east-1:1:profile/P", region: "us-east-1" }))
-    const res = await loader.fetch("https://kiro.test/v1/messages", { method: "POST", headers: { "x-magpie-effort": "low" }, body: JSON.stringify({ model: "gpt-5.6-luna", messages: req.messages }) })
+    const res = await loader.fetch("https://kiro.test/v1/messages", { method: "POST", headers: { "x-magpie-effort": "low" }, body: JSON.stringify({ model: "gpt-5.6-luna", output_config: { effort: "max" }, messages: req.messages }) })
     await res.text()
     expect(paths).toContain("/List-Available-Models")
     expect(bodies).toHaveLength(1)
