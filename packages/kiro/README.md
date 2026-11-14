@@ -132,6 +132,9 @@ request:
     that can't be read or brought under is replaced by a short note, so the
     conversation goes on (#428). Smaller images are sent as they are.
   - Tools the history used but the request doesn't offer are declared.
+  - An assistant turn's thinking goes back as the signature Kiro gave
+    (`reasoningContent`), so a tool turn keeps the reasoning it had; one
+    Kiro no longer takes is left out and the turn asked again.
   - A tool's input schema says `type: "object"` at its root, as Kiro
     wants: one that says no type (or object-or-null) is sent saying so, and
     an empty one as an object with no properties. Kiro answers 400

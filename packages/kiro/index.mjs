@@ -1273,7 +1273,13 @@ function kiroRequest(req, model, profile, budget, conversation) {
       }
       for (const p of parts) {
         if (p?.type === "text" && p.text) texts.push(p.text)
-        else if (p?.type === "tool_use") {
+        else if (p?.type === "thinking") {
+          // Kiro's reasoning, back as the signature it gave; a block
+          // without a signature of Kiro's goes without.
+          if (p.signature) a.reasoningContent = { signature: p.signature }
+        } else if (p?.type === "redacted_thinking") {
+          if (p.data) a.reasoningContent = { redactedContent: p.data }
+        } else if (p?.type === "tool_use") {
           const input = p.input && typeof p.input === "object" && !Array.isArray(p.input) ? p.input : {}
           a.toolUses.push({ name: toolName(p.name), toolUseId: toolID(p.id), input })
         } else if (p?.type === "server_tool_use" && p.name === SEARCH_NAME) {
@@ -2187,6 +2193,7 @@ async function* events(body, model, budget, sse = false) {
           yield { kind: "think", text: m.text }
         }
         if (m.signature) yield { kind: "sig", text: m.signature }
+        if (m.redactedContent) yield { kind: "redacted", text: m.redactedContent }
       } else if (kind === "toolUseEvent") {
         if (m.toolUseId && m.toolUseId !== tool) {
           yield* think.end() // the text before a call is all said
@@ -2314,6 +2321,8 @@ async function reply(it, model, stream, names = new Map()) {
         else add({ type: "thinking", thinking: e.text, signature: "" })
       } else if (e.kind === "sig") {
         if (last?.type === "thinking") last.signature += e.text
+      } else if (e.kind === "redacted") {
+        add({ type: "redacted_thinking", data: e.text })
       } else if (e.kind === "serverTool") add({ type: "server_tool_use", id: e.id, name: e.name, input: e.input })
       else if (e.kind === "searched") add({ type: "web_search_tool_result", tool_use_id: e.id, content: e.content })
       else if (e.kind === "toolStart") add({ type: "tool_use", id: e.id, name: names.get(e.name) ?? e.name, input: "" })
@@ -2378,6 +2387,10 @@ async function reply(it, model, stream, names = new Map()) {
           break
         case "sig":
           if (open === "thinking") ctl.enqueue(sse("content_block_delta", { index, delta: { type: "signature_delta", signature: e.text } }))
+          break
+        case "redacted":
+          begin("redacted", { type: "redacted_thinking", data: e.text })
+          close()
           break
         case "toolStart":
           begin("tool", { type: "tool_use", id: e.id, name: names.get(e.name) ?? e.name, input: {} })
@@ -2637,15 +2650,45 @@ async function generate(creds, auth, req, signal, conversation) {
   const budget = thinking(req, model)
   const hosted = hostedSearch(req)
   if (hosted?.error) return errorResponse(400, hosted.error)
-  const first = await ask(creds, auth, req, model, budget, signal, conversation)
-  if (!first.res) return errorResponse(first.status, first.message, first.wait)
-  const it = hosted ? searching(creds, auth, req, model, budget, signal, hosted, first, conversation) : events(first.res.body, model, budget, responses.has(first.res))
-  return kept(await reply(it, model, req.stream === true, toolNames(req)))
+  const open = async (noReasoning) => {
+    const first = await ask(creds, auth, req, model, budget, signal, conversation, noReasoning)
+    if (!first.res) return { failed: errorResponse(first.status, first.message, first.wait) }
+    const it = hosted ? searching(creds, auth, req, model, budget, signal, hosted, first, conversation, noReasoning) : events(first.res.body, model, budget, responses.has(first.res))
+    return { it, head: await it.next() }
+  }
+  let { it, head, failed } = await open(false)
+  if (failed) return failed
+  // THINKING_SIGNATURE_INVALID: ask again without the reasoning, before
+  // anything is said.
+  if (head.value?.kind === "error" && head.value.text.includes("THINKING_SIGNATURE_INVALID")) {
+    ;({ it, head, failed } = await open(true))
+    if (failed) return failed
+  }
+  const replay = (async function* () {
+    if (!head.done) yield head.value
+    yield* it
+  })()
+  return kept(await reply(replay, model, req.stream === true, toolNames(req)))
+}
+
+// withoutReasoning is body with every assistant turn's reasoningContent
+// left out.
+function withoutReasoning(body) {
+  let q
+  try {
+    q = JSON.parse(body)
+  } catch {
+    return body
+  }
+  for (const e of q?.conversationState?.history ?? []) {
+    if (e?.assistantResponseMessage) delete e.assistantResponseMessage.reasoningContent
+  }
+  return JSON.stringify(q)
 }
 
 // ask sends one turn to Kiro: { res, a }, a 200, or the { status, message }
 // of a failure.
-async function ask(creds, auth, req, model, budget, signal, conversation) {
+async function ask(creds, auth, req, model, budget, signal, conversation, noReasoning = false) {
   let a
   try {
     a = await creds(auth)
@@ -2653,9 +2696,13 @@ async function ask(creds, auth, req, model, budget, signal, conversation) {
     return { status: 401, message: e.message }
   }
   if (a.pinned) return { status: 429, message: pinnedUnavailable(a) }
+  const send = async () => {
+    const body = await kiroBody(req, model, a.profile, budget, conversation)
+    return paced(a, noReasoning ? withoutReasoning(body) : body, signal)
+  }
   let res
   try {
-    res = await paced(a, await kiroBody(req, model, a.profile, budget, conversation), signal)
+    res = await send()
   } catch (e) {
     if (e?.name === "AbortError") throw e
     return { status: 502, message: e.message }
@@ -2668,7 +2715,7 @@ async function ask(creds, auth, req, model, budget, signal, conversation) {
       return { status: 502, message: e.message }
     }
     try {
-      res = await paced(a, await kiroBody(req, model, a.profile, budget, conversation), signal)
+      res = await send()
     } catch (e) {
       if (e?.name === "AbortError") throw e
       return { status: 502, message: e.message }
@@ -2694,7 +2741,7 @@ async function ask(creds, auth, req, model, budget, signal, conversation) {
     if (tried.has(next.region)) return { status: 429, message: regionsUsedUp(next) + f.message, wait: f.wait }
     a = next
     try {
-      res = await paced(a, await kiroBody(req, model, a.profile, budget, conversation), signal)
+      res = await send()
     } catch (e) {
       if (e?.name === "AbortError") throw e
       return { status: 502, message: e.message }
@@ -2734,7 +2781,7 @@ const aborted = () => Object.assign(new Error("the request was cancelled"), { na
 // caller's (passed on as ever, the searches of its turn with it), or has
 // taken hosted.uses + 2 turns (pause_turn, which the caller may send back
 // to go on). Searches past hosted.uses are max_uses_exceeded.
-async function* searching(creds, auth, req, model, budget, signal, hosted, first, conversation) {
+async function* searching(creds, auth, req, model, budget, signal, hosted, first, conversation, noReasoning = false) {
   let { res, a } = first
   const messages = [...(req.messages ?? [])]
   const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reported: false, searches: 0 }
@@ -2846,7 +2893,7 @@ async function* searching(creds, auth, req, model, budget, signal, hosted, first
       return
     }
     messages.push({ role: "assistant", content: said })
-    const next = await ask(creds, auth, { ...req, messages }, model, budget, signal, conversation)
+    const next = await ask(creds, auth, { ...req, messages }, model, budget, signal, conversation, noReasoning)
     if (!next.res) {
       yield { kind: "error", status: next.status, text: `Kiro, after its web search: ${next.message} (${next.status})` }
       return
@@ -3292,4 +3339,4 @@ export async function KiroAuthPlugin({ client, magpie } = {}) {
 }
 
 // for tests
-export const _internal = { generate, responsesBody, crMessages, crRefusal, features, FEATURES, featureKey, waitOf, timing, TRIES, refresh, usageOf, buildKiro, kiroBody, IMAGE_LIMIT, events, reply, failure, toolID, toolName, toolNames, thinking, nativeFields, listModels, rateOf, contextFirst, configModel, runtimeModel, readCLI, readIDE, regionOf, planName, frames }
+export const _internal = { generate, responsesBody, crMessages, crRefusal, features, FEATURES, featureKey, waitOf, timing, TRIES, refresh, usageOf, buildKiro, kiroBody, IMAGE_LIMIT, events, reply, failure, toolID, toolName, toolNames, thinking, nativeFields, listModels, rateOf, contextFirst, configModel, runtimeModel, readCLI, readIDE, regionOf, planName, frames, withoutReasoning }
