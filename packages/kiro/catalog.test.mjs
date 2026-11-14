@@ -25,7 +25,7 @@ async function setup(name, catalogResponse) {
     const url = new URL(String(input))
     if (url.pathname === "/List-Available-Models") {
       reads.push(url)
-      return catalogResponse()
+      return catalogResponse(url, init)
     }
     if (url.pathname === "/featureConfiguration") return Response.json({})
     if (url.pathname !== "/generateAssistantResponse") throw new Error("unexpected " + url.pathname)
@@ -108,6 +108,54 @@ test("failed catalog lookups expire and are separate for each account and region
     now += 10 * 60 * 1000 + 1
     await call(account, credentials)
     expect(s.reads).toHaveLength(4)
+  } finally {
+    Date.now = originalNow
+    s.restore()
+  }
+})
+
+const nativeModel = () => ({ modelId: "gpt-5.6-luna", additionalModelRequestFieldsSchema: { properties: { reasoning: { properties: { effort: { enum: ["low", "high"] } } } } } })
+
+test("native fields use the selected account's regional catalog", async () => {
+  const s = await setup("native-scope", (url, init) => Response.json({ models: [
+    init.headers.Authorization === "Bearer t" && url.hostname.includes("us-east-1") ? nativeModel() : { modelId: "gpt-5.6-luna" },
+  ] }))
+  const call = async (owner, a) => {
+    const res = await s.generate(async () => a, owner, { ...request, model: "gpt-5.6-luna" }, undefined, "session")
+    expect(res.status).toBe(200)
+    await res.text()
+  }
+  try {
+    await call(account, credentials)
+    await call({ ...account, accountId: "account-b" }, { ...credentials, token: "other" })
+    await call(account, { ...credentials, region: "eu-central-1", profile: "arn:aws:codewhisperer:eu-central-1:1:profile/P" })
+    await call(account, credentials)
+    expect(s.reads).toHaveLength(3)
+    expect(s.calls.map(body => body.additionalModelRequestFields)).toEqual([
+      { reasoning: { effort: "high" } }, undefined, undefined, { reasoning: { effort: "high" } },
+    ])
+  } finally {
+    s.restore()
+  }
+})
+
+test("a failed catalog refresh retains the account's last successful native fields", async () => {
+  const originalNow = Date.now
+  let now = Date.now(), reads = 0
+  Date.now = () => now
+  const s = await setup("last-good", () => ++reads === 1 ? Response.json({ models: [nativeModel()] }) : new Response("unavailable", { status: 500 }))
+  const call = async () => {
+    const res = await s.generate(async () => credentials, account, { ...request, model: "gpt-5.6-luna" }, undefined, "session")
+    expect(res.status).toBe(200)
+    await res.text()
+  }
+  try {
+    await call()
+    now += 10 * 60 * 1000 + 1
+    await call()
+    await call()
+    expect(s.reads).toHaveLength(2)
+    expect(s.calls.map(body => body.additionalModelRequestFields)).toEqual(Array.from({ length: 3 }, () => ({ reasoning: { effort: "high" } })))
   } finally {
     Date.now = originalNow
     s.restore()

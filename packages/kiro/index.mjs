@@ -975,13 +975,15 @@ async function listModels(a) {
     if (!name || name === m.modelId) name = m.modelId === "auto" ? "Auto" : m.modelId
     const rate = rateOf(m)
     const model = { id: m.modelId, name, context: m.tokenLimits?.maxInputTokens ?? 0, output: m.tokenLimits?.maxOutputTokens ?? 0,
-      images: (m.supportedInputTypes ?? []).some((t) => String(t).toUpperCase() === "IMAGE"), ...(rate ? { rate } : {}) }
+      images: (m.supportedInputTypes ?? []).some((t) => String(t).toUpperCase() === "IMAGE"), native: nativeOf(m.additionalModelRequestFieldsSchema), ...(rate ? { rate } : {}) }
     if (m.modelId === out?.defaultModel?.modelId) list.unshift(model)
     else list.push(model)
   }
   if (!list.length) throw new Error("Kiro listed no models")
-  for (const m of list) windows.set(m.id, m.context)
-  for (const m of out?.models ?? []) if (m?.modelId) natives.set(m.modelId, nativeOf(m.additionalModelRequestFieldsSchema))
+  for (const m of list) {
+    windows.set(m.id, m.context)
+    natives.set(m.id, m.native)
+  }
   return list
 }
 
@@ -990,10 +992,14 @@ async function loadModelCatalog(a, auth) {
   const key = JSON.stringify([regionKey(auth), auth?.key, a.profile, a.region])
   let lookup = catalogLookups.get(key)
   if (!lookup || lookup.until <= Date.now()) {
-    lookup = { until: Date.now() + CATALOG_TTL, pending: listModels(a).catch(() => {}) }
+    lookup = { until: Date.now() + CATALOG_TTL, models: lookup?.models ?? new Map() }
+    lookup.pending = listModels(a).then(models => {
+      lookup.models = new Map(models.map(m => [m.id, m.native]))
+    }).catch(() => {})
     catalogLookups.set(key, lookup)
   }
   await lookup.pending
+  return lookup.models
 }
 
 // ---- the request: Messages → a Kiro conversation ---------------------------------------
@@ -1181,8 +1187,8 @@ function thinking(req, model) {
 
 // Adaptive models accept effort only with thinking enabled (#538).
 // Native reasoning-only models use reasoning.effort without thinking.type.
-function nativeFields(req, model) {
-  const n = natives.get(model)
+function nativeFields(req, model, catalog) {
+  const n = catalog ? catalog.get(model) : natives.get(model)
   if (!n) return undefined
   const effort = !n.adaptive && req.thinking?.type === "disabled" ? "none" : req.output_config?.effort
   if (typeof effort !== "string" || !n.levels.includes(effort)) return undefined
@@ -1241,14 +1247,14 @@ function reasoningScope(auth, a, model) {
 
 // GenerateAssistantResponse is also the intermediate shape for CreateResponse.
 // Images are fitted by kiroBody.
-function buildKiro(req, model, profile, budget, conversation, scope) {
-  return JSON.stringify(kiroRequest(req, model, profile, budget, conversation, scope))
+function buildKiro(req, model, profile, budget, conversation, scope, catalog) {
+  return JSON.stringify(kiroRequest(req, model, profile, budget, conversation, scope, catalog))
 }
 
 // kiroBody is the body sent: buildKiro's, with every image it keeps under
 // Kiro's size limit.
-async function kiroBody(req, model, profile, budget, conversation, scope) {
-  return JSON.stringify(await fitImages(kiroRequest(req, model, profile, budget, conversation, scope)))
+async function kiroBody(req, model, profile, budget, conversation, scope, catalog) {
+  return JSON.stringify(await fitImages(kiroRequest(req, model, profile, budget, conversation, scope, catalog)))
 }
 
 // UNDERSTOOD is the reply Kiro IDE puts in its history where a turn has
@@ -1279,7 +1285,7 @@ function contextFirst(messages) {
   return [...messages.slice(0, start), ...context.map((m) => ({ ...m, role: "user" })), { role: "assistant", content: UNDERSTOOD }, ...turn]
 }
 
-function kiroRequest(req, model, profile, budget, conversation, scope) {
+function kiroRequest(req, model, profile, budget, conversation, scope, catalog) {
   const entries = []
   // the messages the caller marked for its prompt cache (cache_control),
   // which go to Kiro as a cachePoint on the message they end up in (#110)
@@ -1425,7 +1431,7 @@ function kiroRequest(req, model, profile, budget, conversation, scope) {
   const format = formatText(req)
   if (format) system = system ? system + "\n\n" + format : format
   // a level Kiro takes as a field is sent as one, not also as a budget
-  const native = nativeFields(req, model)
+  const native = nativeFields(req, model, catalog)
   if (budget && !native) system = `<thinking_mode>enabled</thinking_mode><max_thinking_length>${budget}</max_thinking_length>` + (system ? "\n" + system : "")
   if (system) entries[0].userInputMessage.content = system + "\n\n" + entries[0].userInputMessage.content
   if (Array.isArray(req.system)) mark(entries[0].userInputMessage, req.system)
@@ -2713,9 +2719,9 @@ async function ask(creds, auth, req, model, budget, signal, conversation) {
   }
   if (a.pinned) return { status: 429, message: pinnedUnavailable(a) }
   const send = async () => {
-    if (!thinks(model) && !windows.has(model)) await loadModelCatalog(a, auth)
+    const catalog = thinks(model) ? undefined : await loadModelCatalog(a, auth)
     a.scope = reasoningScope(auth, a, model)
-    return paced(a, await kiroBody(req, model, a.profile, budget, conversation, a.scope), signal)
+    return paced(a, await kiroBody(req, model, a.profile, budget, conversation, a.scope, catalog), signal)
   }
   let res
   try {
