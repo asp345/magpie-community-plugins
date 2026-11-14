@@ -862,19 +862,14 @@ function account(client, magpie) {
 const windows = new Map() // a model's context, as Kiro last listed it
 const natives = new Map() // a model's effort levels sent as fields, as Kiro last listed them (nativeOf)
 
-// nativeOf is what a model's additionalModelRequestFieldsSchema in Kiro's
-// list offers, read as Kiro IDE reads it: the effort levels in the enum of
-// output_config's (or reasoning's) effort, and whether thinking.type may be
-// "adaptive". A model offering both is sent the caller's effort in
-// additionalModelRequestFields, as the IDE sends it; any other keeps the
-// <max_thinking_length> budget (#538).
+// nativeOf reads the model's effort levels and whether it requires adaptive thinking.
 function nativeOf(s) {
   if (!s || typeof s !== "object" || Array.isArray(s)) return undefined
   const types = s.properties?.thinking?.properties?.type?.enum
-  if (!Array.isArray(types) || !types.includes("adaptive")) return undefined
+  const adaptive = Array.isArray(types) && types.includes("adaptive")
   for (const path of ["output_config", "reasoning"]) {
     const levels = s.properties?.[path]?.properties?.effort?.enum
-    if (Array.isArray(levels) && levels.length) return { path, levels }
+    if (Array.isArray(levels) && levels.length && (adaptive || path === "reasoning")) return { path, levels, adaptive }
   }
   return undefined
 }
@@ -884,14 +879,19 @@ const thinks = (id) => /claude/i.test(id) || id === "auto"
 // long as max: #120)
 const BUDGETS = { low: 10000, medium: 20000, high: 30000, xhigh: 50000, max: 50000 }
 
+function modelVariants(m) {
+  const native = natives.get(m.id)
+  if (native && !native.adaptive) return Object.fromEntries(native.levels.map((effort) => [effort, { effort }]))
+  return thinks(m.id) ? Object.fromEntries(Object.entries(BUDGETS).map(([k, b]) => [k, { thinking: { type: "enabled", budgetTokens: b } }])) : {}
+}
+
 function configModel(m) {
+  const variants = modelVariants(m)
   return {
     name: m.name,
     limit: { context: m.context ?? 0, output: m.output ?? 0 },
     ...(m.images ? { attachment: true, modalities: { input: ["text", "image"], output: ["text"] } } : {}),
-    ...(thinks(m.id)
-      ? { reasoning: true, variants: Object.fromEntries(Object.entries(BUDGETS).map(([k, b]) => [k, { thinking: { type: "enabled", budgetTokens: b } }])) }
-      : {}),
+    ...(Object.keys(variants).length ? { reasoning: true, variants } : {}),
     tool_call: true,
     // magpie's own: the credit multiplier Kiro lists for the model
     ...(m.rate ? { rate: m.rate } : {}),
@@ -899,6 +899,7 @@ function configModel(m) {
 }
 
 function runtimeModel(m) {
+  const variants = modelVariants(m)
   const input = { text: true, image: !!m.images, audio: false, video: false, pdf: false }
   return {
     id: m.id,
@@ -912,7 +913,7 @@ function runtimeModel(m) {
     limit: { context: m.context ?? 0, output: m.output ?? 0 },
     capabilities: {
       temperature: true,
-      reasoning: thinks(m.id),
+      reasoning: Object.keys(variants).length > 0,
       attachment: !!m.images,
       toolcall: true,
       input,
@@ -922,7 +923,7 @@ function runtimeModel(m) {
     release_date: "",
     // magpie's own: the credit multiplier Kiro lists for the model
     ...(m.rate ? { rate: m.rate } : {}),
-    variants: thinks(m.id) ? Object.fromEntries(Object.entries(BUDGETS).map(([k, b]) => [k, { thinking: { type: "enabled", budgetTokens: b } }])) : {},
+    variants,
   }
 }
 
@@ -1164,15 +1165,14 @@ function thinking(req, model) {
   return 20000
 }
 
-// nativeFields is the additionalModelRequestFields a thinking request is
-// sent with when Kiro's list says the model takes its effort as a field:
-// adaptive thinking at the caller's level, so xhigh and max reach the model
-// as two levels rather than one 50000 budget (#538). undefined otherwise.
+// nativeFields sends effort on the field advertised by the model's schema.
 function nativeFields(req, model) {
   const n = natives.get(model)
-  const effort = req.output_config?.effort
-  if (!n || typeof effort !== "string" || !n.levels.includes(effort) || !thinking(req, model)) return undefined
-  return { thinking: { type: "adaptive" }, [n.path]: { effort } }
+  if (!n) return undefined
+  const effort = !n.adaptive && req.thinking?.type === "disabled" ? "none" : req.output_config?.effort
+  if (typeof effort !== "string" || !n.levels.includes(effort)) return undefined
+  if (n.adaptive && !thinking(req, model)) return undefined
+  return { ...(n.adaptive ? { thinking: { type: "adaptive" } } : {}), [n.path]: { effort } }
 }
 
 // formatText is the structured output a request asks for, said in words:
@@ -1201,16 +1201,37 @@ function inputSchema(s) {
   return s
 }
 
-// buildKiro is the body of a generateAssistantResponse call, as it is
-// before its images are fitted (kiroBody).
-function buildKiro(req, model, profile, budget, conversation) {
-  return JSON.stringify(kiroRequest(req, model, profile, budget, conversation))
+function sealReasoning(value, scope) {
+  return `kiro:${scope}:${Buffer.from(JSON.stringify(value)).toString("base64url")}`
+}
+
+function unsealReasoning(value, scope) {
+  const prefix = `kiro:${scope}:`
+  if (!scope || typeof value !== "string" || !value.startsWith(prefix)) return undefined
+  let content
+  try {
+    content = JSON.parse(Buffer.from(value.slice(prefix.length), "base64url").toString())
+  } catch {
+    return undefined
+  }
+  if (typeof content?.reasoningText?.text === "string" && typeof content.reasoningText.signature === "string" && content.reasoningText.signature) return content
+  if (typeof content?.redactedContent === "string" && content.redactedContent) return content
+  return undefined
+}
+
+function reasoningScope(auth, a, model) {
+  const identity = auth?.source ? a.token : auth?.key ?? auth?.accountId ?? a.token
+  return createHash("sha256").update(JSON.stringify([identity, auth?.uid ?? uidOf(auth?.loginProvider), a.profile, a.region, model])).digest("hex").slice(0, 32)
+}
+
+function buildKiro(req, model, profile, budget, conversation, scope) {
+  return JSON.stringify(kiroRequest(req, model, profile, budget, conversation, scope))
 }
 
 // kiroBody is the body sent: buildKiro's, with every image it keeps under
 // Kiro's size limit.
-async function kiroBody(req, model, profile, budget, conversation) {
-  return JSON.stringify(await fitImages(kiroRequest(req, model, profile, budget, conversation)))
+async function kiroBody(req, model, profile, budget, conversation, scope) {
+  return JSON.stringify(await fitImages(kiroRequest(req, model, profile, budget, conversation, scope)))
 }
 
 // UNDERSTOOD is the reply Kiro IDE puts in its history where a turn has
@@ -1241,7 +1262,7 @@ function contextFirst(messages) {
   return [...messages.slice(0, start), ...context.map((m) => ({ ...m, role: "user" })), { role: "assistant", content: UNDERSTOOD }, ...turn]
 }
 
-function kiroRequest(req, model, profile, budget, conversation) {
+function kiroRequest(req, model, profile, budget, conversation, scope) {
   const entries = []
   // the messages the caller marked for its prompt cache (cache_control),
   // which go to Kiro as a cachePoint on the message they end up in (#110)
@@ -1262,23 +1283,21 @@ function kiroRequest(req, model, profile, budget, conversation) {
       let last = null
       const flush = () => {
         a.content = texts.splice(0).join("\n\n")
-        if (!a.content && !a.toolUses.length) return // what only thought
+        if (!a.content && !a.toolUses.length && !a.reasoningContent) return
         const prev = entries.at(-1)?.assistantResponseMessage
         if (prev) {
           prev.content = joinNonEmpty(prev.content, a.content)
           prev.toolUses.push(...a.toolUses)
+          if (a.reasoningContent) prev.reasoningContent = a.reasoningContent
         } else entries.push({ assistantResponseMessage: a })
         last = prev ?? a
         a = { content: "", toolUses: [] }
       }
       for (const p of parts) {
         if (p?.type === "text" && p.text) texts.push(p.text)
-        else if (p?.type === "thinking") {
-          // Kiro's reasoning, back as the signature it gave; a block
-          // without a signature of Kiro's goes without.
-          if (p.signature) a.reasoningContent = { signature: p.signature }
-        } else if (p?.type === "redacted_thinking") {
-          if (p.data) a.reasoningContent = { redactedContent: p.data }
+        else if (p?.type === "thinking" || p?.type === "redacted_thinking") {
+          const reasoning = unsealReasoning(p.signature ?? p.data, scope)
+          if (reasoning) a.reasoningContent = reasoning
         } else if (p?.type === "tool_use") {
           const input = p.input && typeof p.input === "object" && !Array.isArray(p.input) ? p.input : {}
           a.toolUses.push({ name: toolName(p.name), toolUseId: toolID(p.id), input })
@@ -1389,7 +1408,7 @@ function kiroRequest(req, model, profile, budget, conversation) {
   const format = formatText(req)
   if (format) system = system ? system + "\n\n" + format : format
   // a level Kiro takes as a field is sent as one, not also as a budget
-  const native = budget ? nativeFields(req, model) : undefined
+  const native = nativeFields(req, model)
   if (budget && !native) system = `<thinking_mode>enabled</thinking_mode><max_thinking_length>${budget}</max_thinking_length>` + (system ? "\n" + system : "")
   if (system) entries[0].userInputMessage.content = system + "\n\n" + entries[0].userInputMessage.content
   if (Array.isArray(req.system)) mark(entries[0].userInputMessage, req.system)
@@ -1766,6 +1785,7 @@ function responsesInput(e) {
   }
   const m = e.assistantResponseMessage
   if (m) {
+    if (m.reasoningContent) out.push({ type: "reasoning", encrypted_content: JSON.stringify(m.reasoningContent) })
     if (typeof m.content === "string" && m.content) out.push({ role: "assistant", content: m.content })
     for (const c of m.toolUses ?? [])
       out.push({ type: "function_call", call_id: c.toolUseId, name: c.name, arguments: typeof c.input === "string" ? c.input : JSON.stringify(c.input ?? {}) })
@@ -1824,7 +1844,8 @@ async function* crMessages(body) {
         env = JSON.parse(w.item.encrypted_content)
       } catch {}
       const sig = env?.reasoningText?.signature
-      if (typeof sig === "string" && sig) yield { kind: "reasoningContentEvent", m: { signature: sig } }
+      if (typeof sig === "string" && sig) yield { kind: "reasoningContentEvent", m: { signature: sig, encrypted: env } }
+      if (typeof env?.redactedContent === "string" && env.redactedContent) yield { kind: "reasoningContentEvent", m: { redactedContent: env.redactedContent } }
     } else if (type === "response.refusal.delta" && typeof w.delta === "string") {
       // a refusal is said as the reply's text
       refused = true
@@ -2157,8 +2178,9 @@ async function* garMessages(body) {
 
 // events turns Kiro's reply into events: text, thinking, tool calls (the
 // arguments in pieces), then the usage and why it stopped — or an error.
-async function* events(body, model, budget, sse = false) {
+async function* events(body, model, budget, sse = false, scope) {
   const think = new ThinkParser()
+  let reasoningText = ""
   let tool = ""
   let tools = 0
   let stop = ""
@@ -2189,11 +2211,16 @@ async function* events(body, model, budget, sse = false) {
         // one event may carry the reasoning and its signature together (auto,
         // called as the IDE): the signature goes on the block it ends
         if (m.text) {
+          reasoningText += m.text
           said += m.text.length
           yield { kind: "think", text: m.text }
         }
-        if (m.signature) yield { kind: "sig", text: m.signature }
-        if (m.redactedContent) yield { kind: "redacted", text: m.redactedContent }
+        if (m.signature) {
+          const content = m.encrypted ?? { reasoningText: { text: reasoningText, signature: m.signature } }
+          yield { kind: "sig", text: sealReasoning(content, scope) }
+          reasoningText = ""
+        }
+        if (m.redactedContent) yield { kind: "redacted", text: sealReasoning({ redactedContent: m.redactedContent }, scope) }
       } else if (kind === "toolUseEvent") {
         if (m.toolUseId && m.toolUseId !== tool) {
           yield* think.end() // the text before a call is all said
@@ -2320,7 +2347,8 @@ async function reply(it, model, stream, names = new Map()) {
         if (last?.type === "thinking") last.thinking += e.text
         else add({ type: "thinking", thinking: e.text, signature: "" })
       } else if (e.kind === "sig") {
-        if (last?.type === "thinking") last.signature += e.text
+        if (last?.type !== "thinking") add({ type: "thinking", thinking: "", signature: "" })
+        last.signature += e.text
       } else if (e.kind === "redacted") {
         add({ type: "redacted_thinking", data: e.text })
       } else if (e.kind === "serverTool") add({ type: "server_tool_use", id: e.id, name: e.name, input: e.input })
@@ -2386,7 +2414,8 @@ async function reply(it, model, stream, names = new Map()) {
           ctl.enqueue(sse("content_block_delta", { index, delta: { type: "thinking_delta", thinking: e.text } }))
           break
         case "sig":
-          if (open === "thinking") ctl.enqueue(sse("content_block_delta", { index, delta: { type: "signature_delta", signature: e.text } }))
+          if (open !== "thinking") begin("thinking", { type: "thinking", thinking: "", signature: "" })
+          ctl.enqueue(sse("content_block_delta", { index, delta: { type: "signature_delta", signature: e.text } }))
           break
         case "redacted":
           begin("redacted", { type: "redacted_thinking", data: e.text })
@@ -2650,45 +2679,15 @@ async function generate(creds, auth, req, signal, conversation) {
   const budget = thinking(req, model)
   const hosted = hostedSearch(req)
   if (hosted?.error) return errorResponse(400, hosted.error)
-  const open = async (noReasoning) => {
-    const first = await ask(creds, auth, req, model, budget, signal, conversation, noReasoning)
-    if (!first.res) return { failed: errorResponse(first.status, first.message, first.wait) }
-    const it = hosted ? searching(creds, auth, req, model, budget, signal, hosted, first, conversation, noReasoning) : events(first.res.body, model, budget, responses.has(first.res))
-    return { it, head: await it.next() }
-  }
-  let { it, head, failed } = await open(false)
-  if (failed) return failed
-  // THINKING_SIGNATURE_INVALID: ask again without the reasoning, before
-  // anything is said.
-  if (head.value?.kind === "error" && head.value.text.includes("THINKING_SIGNATURE_INVALID")) {
-    ;({ it, head, failed } = await open(true))
-    if (failed) return failed
-  }
-  const replay = (async function* () {
-    if (!head.done) yield head.value
-    yield* it
-  })()
-  return kept(await reply(replay, model, req.stream === true, toolNames(req)))
-}
-
-// withoutReasoning is body with every assistant turn's reasoningContent
-// left out.
-function withoutReasoning(body) {
-  let q
-  try {
-    q = JSON.parse(body)
-  } catch {
-    return body
-  }
-  for (const e of q?.conversationState?.history ?? []) {
-    if (e?.assistantResponseMessage) delete e.assistantResponseMessage.reasoningContent
-  }
-  return JSON.stringify(q)
+  const first = await ask(creds, auth, req, model, budget, signal, conversation)
+  if (!first.res) return errorResponse(first.status, first.message, first.wait)
+  const it = hosted ? searching(creds, auth, req, model, budget, signal, hosted, first, conversation) : events(first.res.body, model, budget, responses.has(first.res), first.a.scope)
+  return kept(await reply(it, model, req.stream === true, toolNames(req)))
 }
 
 // ask sends one turn to Kiro: { res, a }, a 200, or the { status, message }
 // of a failure.
-async function ask(creds, auth, req, model, budget, signal, conversation, noReasoning = false) {
+async function ask(creds, auth, req, model, budget, signal, conversation) {
   let a
   try {
     a = await creds(auth)
@@ -2697,8 +2696,9 @@ async function ask(creds, auth, req, model, budget, signal, conversation, noReas
   }
   if (a.pinned) return { status: 429, message: pinnedUnavailable(a) }
   const send = async () => {
-    const body = await kiroBody(req, model, a.profile, budget, conversation)
-    return paced(a, noReasoning ? withoutReasoning(body) : body, signal)
+    if (!thinks(model) && !windows.has(model)) await listModels(a)
+    a.scope = reasoningScope(auth, a, model)
+    return paced(a, await kiroBody(req, model, a.profile, budget, conversation, a.scope), signal)
   }
   let res
   try {
@@ -2781,7 +2781,7 @@ const aborted = () => Object.assign(new Error("the request was cancelled"), { na
 // caller's (passed on as ever, the searches of its turn with it), or has
 // taken hosted.uses + 2 turns (pause_turn, which the caller may send back
 // to go on). Searches past hosted.uses are max_uses_exceeded.
-async function* searching(creds, auth, req, model, budget, signal, hosted, first, conversation, noReasoning = false) {
+async function* searching(creds, auth, req, model, budget, signal, hosted, first, conversation) {
   let { res, a } = first
   const messages = [...(req.messages ?? [])]
   const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reported: false, searches: 0 }
@@ -2792,7 +2792,7 @@ async function* searching(creds, auth, req, model, budget, signal, hosted, first
     let client = false
     let current = null
     let stop = null
-    for await (const e of events(res.body, model, budget, responses.has(res))) {
+    for await (const e of events(res.body, model, budget, responses.has(res), a.scope)) {
       if (e.kind === "toolStart") {
         current = e.name === SEARCH_NAME ? { args: "" } : null
         if (current) calls.push(current)
@@ -2814,7 +2814,14 @@ async function* searching(creds, auth, req, model, budget, signal, hosted, first
           const b = said.at(-1)
           if (b?.type === "text") b.text += e.text
           else said.push({ type: "text", text: e.text })
-        }
+        } else if (e.kind === "think") {
+          const b = said.at(-1)
+          if (b?.type === "thinking") b.thinking += e.text
+          else said.push({ type: "thinking", thinking: e.text, signature: "" })
+        } else if (e.kind === "sig") {
+          if (said.at(-1)?.type !== "thinking") said.push({ type: "thinking", thinking: "", signature: "" })
+          said.at(-1).signature += e.text
+        } else if (e.kind === "redacted") said.push({ type: "redacted_thinking", data: e.text })
         if (e.kind === "error") {
           // in a turn after a search, a status, not a finished answer
           // (reply): one past the window says so, as failedBefore does
@@ -2893,7 +2900,7 @@ async function* searching(creds, auth, req, model, budget, signal, hosted, first
       return
     }
     messages.push({ role: "assistant", content: said })
-    const next = await ask(creds, auth, { ...req, messages }, model, budget, signal, conversation, noReasoning)
+    const next = await ask(creds, auth, { ...req, messages }, model, budget, signal, conversation)
     if (!next.res) {
       yield { kind: "error", status: next.status, text: `Kiro, after its web search: ${next.message} (${next.status})` }
       return
@@ -3237,6 +3244,8 @@ export async function KiroAuthPlugin({ client, magpie } = {}) {
             } catch {
               return errorResponse(400, "a request that isn't JSON")
             }
+            const effort = new Headers(init.headers ?? (input instanceof Request ? input.headers : undefined)).get("x-magpie-effort")
+            if (effort) req.output_config = { ...req.output_config, effort }
             return generate(creds, (await getAuth()) ?? auth, req, init.signal, sessionOf(input, init))
           },
         }
@@ -3339,4 +3348,4 @@ export async function KiroAuthPlugin({ client, magpie } = {}) {
 }
 
 // for tests
-export const _internal = { generate, responsesBody, crMessages, crRefusal, features, FEATURES, featureKey, waitOf, timing, TRIES, refresh, usageOf, buildKiro, kiroBody, IMAGE_LIMIT, events, reply, failure, toolID, toolName, toolNames, thinking, nativeFields, listModels, rateOf, contextFirst, configModel, runtimeModel, readCLI, readIDE, regionOf, planName, frames, withoutReasoning }
+export const _internal = { generate, responsesBody, crMessages, crRefusal, features, FEATURES, featureKey, waitOf, timing, TRIES, refresh, usageOf, buildKiro, kiroBody, IMAGE_LIMIT, events, reply, failure, toolID, toolName, toolNames, thinking, nativeFields, listModels, rateOf, contextFirst, configModel, runtimeModel, readCLI, readIDE, regionOf, planName, frames, sealReasoning, unsealReasoning, reasoningScope }
